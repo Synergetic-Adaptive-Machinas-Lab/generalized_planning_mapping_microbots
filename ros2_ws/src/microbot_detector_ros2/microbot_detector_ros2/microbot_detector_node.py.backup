@@ -1,0 +1,607 @@
+#!/usr/bin/env python3
+
+"""
+Microbot Detector ROS2 Node
+
+This node detects microbots from a USB camera feed and publishes:
+- Total count of microbots
+- Individual microbot positions with grid assignments
+- Coarse and fine occupancy grids
+- Debug visualization images
+
+Author: [Your Name]
+Date: 2026
+ROS Version: ROS2
+"""
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+import cv2
+import numpy as np
+from sensor_msgs.msg import Image
+from std_msgs.msg import Int32, Header
+from cv_bridge import CvBridge, CvBridgeError
+import time
+from scipy.spatial.distance import cdist
+
+# Import custom messages (will be available after building)
+from microbot_detector_ros2.msg import MicrobotPosition, MicrobotArray, OccupancyGrid
+
+
+class MicrobotDetectorNode(Node):
+    """ROS2 Node for detecting and tracking microbots"""
+    
+    def __init__(self):
+        super().__init__('microbot_detector')
+        
+        self.get_logger().info("Initializing Microbot Detector Node...")
+        
+        # Declare and load parameters
+        self.declare_parameters()
+        self.load_parameters()
+        
+        # Initialize CV Bridge for image conversion
+        self.bridge = CvBridge()
+        
+        # Initialize camera
+        self.cap = None
+        self.initialize_camera()
+        
+        # Setup ROS publishers with QoS
+        self.setup_publishers()
+        
+        # Tracking variables
+        self.next_robot_id = 0
+        self.previous_positions = []  # List of (x, y, id) tuples
+        
+        # Performance tracking
+        self.last_console_print = time.time()
+        self.frame_count = 0
+        self.skip_counter = 0
+        
+        # Create timer for main loop
+        timer_period = 1.0 / self.publish_rate  # seconds
+        self.timer = self.create_timer(timer_period, self.timer_callback)
+        
+        self.get_logger().info("Microbot Detector Node initialized successfully!")
+        self.get_logger().info(f"Publishing to topics:")
+        self.get_logger().info(f"  - Robot count: {self.topic_robot_count}")
+        self.get_logger().info(f"  - Robot positions: {self.topic_robot_positions}")
+        self.get_logger().info(f"  - Coarse grid: {self.topic_coarse_grid}")
+        self.get_logger().info(f"  - Fine grid: {self.topic_fine_grid}")
+    
+    def declare_parameters(self):
+        """Declare all ROS2 parameters with default values"""
+        
+        # Camera parameters
+        self.declare_parameter('camera.index', 0)
+        self.declare_parameter('camera.frame_width', 640)
+        self.declare_parameter('camera.frame_height', 480)
+        self.declare_parameter('camera.fps', 30)
+        self.declare_parameter('camera.roi_x', -1)
+        self.declare_parameter('camera.roi_y', -1)
+        self.declare_parameter('camera.roi_width', -1)
+        self.declare_parameter('camera.roi_height', -1)
+        
+        # Detection parameters
+        self.declare_parameter('detection.binary_threshold', 140)
+        self.declare_parameter('detection.min_contour_area', 5)
+        self.declare_parameter('detection.max_contour_area', 5000)
+        self.declare_parameter('detection.gaussian_blur_kernel', 5)
+        self.declare_parameter('detection.use_morphology', True)
+        self.declare_parameter('detection.morph_kernel_size', 3)
+        self.declare_parameter('detection.morph_iterations', 1)
+        
+        # Grid parameters
+        self.declare_parameter('grid.coarse_rows', 3)
+        self.declare_parameter('grid.coarse_cols', 3)
+        self.declare_parameter('grid.fine_rows', 9)
+        self.declare_parameter('grid.fine_cols', 9)
+        
+        # Topic names
+        self.declare_parameter('topics.robot_count', '/microbot/count')
+        self.declare_parameter('topics.robot_positions', '/microbot/positions')
+        self.declare_parameter('topics.coarse_grid', '/microbot/occupancy/coarse')
+        self.declare_parameter('topics.fine_grid', '/microbot/occupancy/fine')
+        self.declare_parameter('topics.debug_image', '/microbot/debug/image')
+        self.declare_parameter('topics.binary_image', '/microbot/debug/binary')
+        self.declare_parameter('topics.raw_image', '/microbot/camera/raw')
+        
+        # Visualization parameters
+        self.declare_parameter('visualization.show_opencv_windows', True)
+        self.declare_parameter('visualization.draw_grid_lines', True)
+        self.declare_parameter('visualization.draw_contours', True)
+        self.declare_parameter('visualization.draw_centroids', True)
+        self.declare_parameter('visualization.draw_ids', True)
+        self.declare_parameter('visualization.draw_occupancy_text', True)
+        self.declare_parameter('visualization.grid_color', [0, 255, 0])
+        self.declare_parameter('visualization.contour_color', [0, 0, 255])
+        self.declare_parameter('visualization.centroid_color', [255, 0, 0])
+        self.declare_parameter('visualization.id_text_color', [255, 255, 0])
+        
+        # Tracking parameters
+        self.declare_parameter('tracking.enable_tracking', True)
+        self.declare_parameter('tracking.max_distance', 50)
+        
+        # Performance parameters
+        self.declare_parameter('performance.publish_rate', 30)
+        self.declare_parameter('performance.skip_frames', 0)
+        
+        # Logging parameters
+        self.declare_parameter('logging.console_output', True)
+        self.declare_parameter('logging.console_rate', 1.0)
+    
+    def load_parameters(self):
+        """Load all parameters from ROS2 parameter server"""
+        
+        # Camera parameters
+        self.camera_index = self.get_parameter('camera.index').value
+        self.frame_width = self.get_parameter('camera.frame_width').value
+        self.frame_height = self.get_parameter('camera.frame_height').value
+        self.camera_fps = self.get_parameter('camera.fps').value
+        self.roi_x = self.get_parameter('camera.roi_x').value
+        self.roi_y = self.get_parameter('camera.roi_y').value
+        self.roi_width = self.get_parameter('camera.roi_width').value
+        self.roi_height = self.get_parameter('camera.roi_height').value
+        
+        # Detection parameters
+        self.binary_threshold = self.get_parameter('detection.binary_threshold').value
+        self.min_contour_area = self.get_parameter('detection.min_contour_area').value
+        self.max_contour_area = self.get_parameter('detection.max_contour_area').value
+        self.gaussian_kernel = self.get_parameter('detection.gaussian_blur_kernel').value
+        self.use_morphology = self.get_parameter('detection.use_morphology').value
+        self.morph_kernel_size = self.get_parameter('detection.morph_kernel_size').value
+        self.morph_iterations = self.get_parameter('detection.morph_iterations').value
+        
+        # Grid parameters
+        self.coarse_rows = self.get_parameter('grid.coarse_rows').value
+        self.coarse_cols = self.get_parameter('grid.coarse_cols').value
+        self.fine_rows = self.get_parameter('grid.fine_rows').value
+        self.fine_cols = self.get_parameter('grid.fine_cols').value
+        
+        # Topic names
+        self.topic_robot_count = self.get_parameter('topics.robot_count').value
+        self.topic_robot_positions = self.get_parameter('topics.robot_positions').value
+        self.topic_coarse_grid = self.get_parameter('topics.coarse_grid').value
+        self.topic_fine_grid = self.get_parameter('topics.fine_grid').value
+        self.topic_debug_image = self.get_parameter('topics.debug_image').value
+        self.topic_binary_image = self.get_parameter('topics.binary_image').value
+        self.topic_raw_image = self.get_parameter('topics.raw_image').value
+        
+        # Visualization parameters
+        self.show_opencv_windows = self.get_parameter('visualization.show_opencv_windows').value
+        self.draw_grid_lines = self.get_parameter('visualization.draw_grid_lines').value
+        self.draw_contours = self.get_parameter('visualization.draw_contours').value
+        self.draw_centroids = self.get_parameter('visualization.draw_centroids').value
+        self.draw_ids = self.get_parameter('visualization.draw_ids').value
+        self.draw_occupancy_text = self.get_parameter('visualization.draw_occupancy_text').value
+        self.grid_color = tuple(self.get_parameter('visualization.grid_color').value)
+        self.contour_color = tuple(self.get_parameter('visualization.contour_color').value)
+        self.centroid_color = tuple(self.get_parameter('visualization.centroid_color').value)
+        self.id_text_color = tuple(self.get_parameter('visualization.id_text_color').value)
+        
+        # Tracking parameters
+        self.enable_tracking = self.get_parameter('tracking.enable_tracking').value
+        self.max_tracking_distance = self.get_parameter('tracking.max_distance').value
+        
+        # Performance parameters
+        self.publish_rate = self.get_parameter('performance.publish_rate').value
+        self.skip_frames = self.get_parameter('performance.skip_frames').value
+        
+        # Logging parameters
+        self.console_output = self.get_parameter('logging.console_output').value
+        self.console_rate = self.get_parameter('logging.console_rate').value
+    
+    def initialize_camera(self):
+        """Initialize the USB camera with specified parameters"""
+        try:
+            self.cap = cv2.VideoCapture(self.camera_index)
+            
+            if not self.cap.isOpened():
+                self.get_logger().error(f"Failed to open camera at index {self.camera_index}")
+                raise Exception("Camera initialization failed")
+            
+            # Set camera properties
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+            self.cap.set(cv2.CAP_PROP_FPS, self.camera_fps)
+            
+            # Verify settings
+            actual_width = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            actual_height = self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            
+            self.get_logger().info(f"Camera initialized at index {self.camera_index}")
+            self.get_logger().info(f"Resolution: {int(actual_width)}x{int(actual_height)}")
+            self.get_logger().info(f"FPS: {actual_fps}")
+            
+            return True
+            
+        except Exception as e:
+            self.get_logger().error(f"Error initializing camera: {e}")
+            return False
+    
+    def setup_publishers(self):
+        """Setup all ROS2 publishers with QoS profiles"""
+        
+        # QoS profile for sensor data
+        sensor_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
+        # QoS profile for reliable data
+        reliable_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        
+        self.pub_count = self.create_publisher(Int32, self.topic_robot_count, reliable_qos)
+        self.pub_positions = self.create_publisher(MicrobotArray, self.topic_robot_positions, reliable_qos)
+        self.pub_coarse_grid = self.create_publisher(OccupancyGrid, self.topic_coarse_grid, reliable_qos)
+        self.pub_fine_grid = self.create_publisher(OccupancyGrid, self.topic_fine_grid, reliable_qos)
+        self.pub_debug_image = self.create_publisher(Image, self.topic_debug_image, sensor_qos)
+        self.pub_binary_image = self.create_publisher(Image, self.topic_binary_image, sensor_qos)
+        self.pub_raw_image = self.create_publisher(Image, self.topic_raw_image, sensor_qos)
+    
+    def apply_roi(self, frame):
+        """Apply Region of Interest cropping if specified"""
+        if self.roi_x != -1 and self.roi_y != -1 and self.roi_width != -1 and self.roi_height != -1:
+            h, w = frame.shape[:2]
+            x1 = max(0, self.roi_x)
+            y1 = max(0, self.roi_y)
+            x2 = min(w, self.roi_x + self.roi_width)
+            y2 = min(h, self.roi_y + self.roi_height)
+            return frame[y1:y2, x1:x2]
+        return frame
+    
+    def preprocess_frame(self, frame):
+        """Convert frame to binary (black robots on white background)"""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        kernel_size = self.gaussian_kernel if self.gaussian_kernel % 2 == 1 else self.gaussian_kernel + 1
+        blurred = cv2.GaussianBlur(gray, (kernel_size, kernel_size), 0)
+        _, binary = cv2.threshold(blurred, self.binary_threshold, 255, cv2.THRESH_BINARY_INV)
+        
+        if self.use_morphology:
+            kernel = np.ones((self.morph_kernel_size, self.morph_kernel_size), np.uint8)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=self.morph_iterations)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=self.morph_iterations)
+        
+        return binary, gray
+    
+    def detect_microbots(self, binary_image):
+        """Detect microbot positions from binary image"""
+        contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        robot_data = []
+        valid_contours = []
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            
+            if self.min_contour_area < area < self.max_contour_area:
+                M = cv2.moments(contour)
+                if M["m00"] != 0:
+                    cx = M["m10"] / M["m00"]
+                    cy = M["m01"] / M["m00"]
+                    
+                    robot_data.append({
+                        'x': cx,
+                        'y': cy,
+                        'area': area,
+                        'contour': contour
+                    })
+                    valid_contours.append(contour)
+        
+        return robot_data, valid_contours
+    
+    def assign_robot_ids(self, robot_data):
+        """Assign IDs to robots using simple nearest-neighbor tracking"""
+        if not self.enable_tracking or len(robot_data) == 0:
+            for i, robot in enumerate(robot_data):
+                robot['id'] = i
+            return robot_data
+        
+        current_positions = np.array([[r['x'], r['y']] for r in robot_data])
+        
+        if len(self.previous_positions) == 0:
+            for robot in robot_data:
+                robot['id'] = self.next_robot_id
+                self.next_robot_id += 1
+        else:
+            prev_positions = np.array([[p[0], p[1]] for p in self.previous_positions])
+            prev_ids = [p[2] for p in self.previous_positions]
+            
+            if len(prev_positions) > 0 and len(current_positions) > 0:
+                distances = cdist(current_positions, prev_positions)
+                
+                assigned_ids = set()
+                for i, robot in enumerate(robot_data):
+                    min_idx = np.argmin(distances[i])
+                    min_dist = distances[i, min_idx]
+                    
+                    if min_dist < self.max_tracking_distance and prev_ids[min_idx] not in assigned_ids:
+                        robot['id'] = prev_ids[min_idx]
+                        assigned_ids.add(prev_ids[min_idx])
+                    else:
+                        robot['id'] = self.next_robot_id
+                        self.next_robot_id += 1
+            else:
+                for robot in robot_data:
+                    robot['id'] = self.next_robot_id
+                    self.next_robot_id += 1
+        
+        self.previous_positions = [(r['x'], r['y'], r['id']) for r in robot_data]
+        return robot_data
+    
+    def compute_grid_assignment(self, x, y, frame_shape, grid_rows, grid_cols):
+        """Compute which grid cell a position belongs to"""
+        height, width = frame_shape[:2]
+        norm_x = x / width
+        norm_y = y / height
+        col = int(norm_x * grid_cols)
+        row = int(norm_y * grid_rows)
+        col = min(col, grid_cols - 1)
+        row = min(row, grid_rows - 1)
+        return row, col, norm_x, norm_y
+    
+    def create_occupancy_grids(self, robot_data, frame_shape):
+        """Create both coarse and fine occupancy grids"""
+        coarse_grid = np.zeros((self.coarse_rows, self.coarse_cols), dtype=int)
+        fine_grid = np.zeros((self.fine_rows, self.fine_cols), dtype=int)
+        
+        for robot in robot_data:
+            x, y = robot['x'], robot['y']
+            
+            c_row, c_col, _, _ = self.compute_grid_assignment(
+                x, y, frame_shape, self.coarse_rows, self.coarse_cols)
+            coarse_grid[c_row, c_col] += 1
+            robot['coarse_row'] = c_row
+            robot['coarse_col'] = c_col
+            
+            f_row, f_col, norm_x, norm_y = self.compute_grid_assignment(
+                x, y, frame_shape, self.fine_rows, self.fine_cols)
+            fine_grid[f_row, f_col] += 1
+            robot['fine_row'] = f_row
+            robot['fine_col'] = f_col
+            robot['norm_x'] = norm_x
+            robot['norm_y'] = norm_y
+        
+        return coarse_grid, fine_grid
+    
+    def draw_visualization(self, frame, robot_data, contours, coarse_grid, fine_grid):
+        """Draw all visualization elements on frame"""
+        annotated = frame.copy()
+        height, width = frame.shape[:2]
+        
+        if self.draw_grid_lines:
+            cell_width = width / self.coarse_cols
+            cell_height = height / self.coarse_rows
+            
+            for i in range(1, self.coarse_cols):
+                x = int(i * cell_width)
+                cv2.line(annotated, (x, 0), (x, height), self.grid_color, 2)
+            
+            for i in range(1, self.coarse_rows):
+                y = int(i * cell_height)
+                cv2.line(annotated, (0, y), (width, y), self.grid_color, 2)
+        
+        if self.draw_contours and contours:
+            cv2.drawContours(annotated, contours, -1, self.contour_color, 2)
+        
+        for robot in robot_data:
+            x, y = int(robot['x']), int(robot['y'])
+            
+            if self.draw_centroids:
+                cv2.circle(annotated, (x, y), 5, self.centroid_color, -1)
+                cv2.circle(annotated, (x, y), 8, self.id_text_color, 2)
+            
+            if self.draw_ids:
+                cv2.putText(annotated, f"{robot['id']}", (x + 12, y - 12),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.id_text_color, 2)
+        
+        if self.draw_occupancy_text:
+            cell_width = width / self.coarse_cols
+            cell_height = height / self.coarse_rows
+            
+            for row in range(self.coarse_rows):
+                for col in range(self.coarse_cols):
+                    count = coarse_grid[row, col]
+                    
+                    if count > 0:
+                        text_x = int((col + 0.5) * cell_width)
+                        text_y = int((row + 0.5) * cell_height)
+                        cv2.putText(annotated, str(count), (text_x - 15, text_y + 10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 255), 3)
+        
+        total_robots = len(robot_data)
+        info_text = f"Robots: {total_robots} | Threshold: {self.binary_threshold} | Frame: {self.frame_count}"
+        cv2.putText(annotated, info_text, (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        return annotated
+    
+    def publish_data(self, robot_data, coarse_grid, fine_grid, debug_frame, binary_frame, raw_frame):
+        """Publish all ROS2 messages"""
+        
+        # Create header with timestamp
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = "camera_frame"
+        
+        # Publish robot count
+        count_msg = Int32()
+        count_msg.data = len(robot_data)
+        self.pub_count.publish(count_msg)
+        
+        # Publish robot positions array
+        positions_msg = MicrobotArray()
+        positions_msg.header = header
+        positions_msg.total_count = len(robot_data)
+        
+        for robot in robot_data:
+            pos_msg = MicrobotPosition()
+            pos_msg.x = float(robot['x'])
+            pos_msg.y = float(robot['y'])
+            pos_msg.normalized_x = float(robot['norm_x'])
+            pos_msg.normalized_y = float(robot['norm_y'])
+            pos_msg.coarse_grid_row = int(robot['coarse_row'])
+            pos_msg.coarse_grid_col = int(robot['coarse_col'])
+            pos_msg.fine_grid_row = int(robot['fine_row'])
+            pos_msg.fine_grid_col = int(robot['fine_col'])
+            pos_msg.robot_id = int(robot['id'])
+            pos_msg.area = float(robot['area'])
+            positions_msg.microbots.append(pos_msg)
+        
+        self.pub_positions.publish(positions_msg)
+        
+        # Publish coarse occupancy grid
+        coarse_msg = OccupancyGrid()
+        coarse_msg.header = header
+        coarse_msg.grid_rows = self.coarse_rows
+        coarse_msg.grid_cols = self.coarse_cols
+        coarse_msg.data = coarse_grid.flatten().tolist()
+        coarse_msg.grid_type = "coarse"
+        self.pub_coarse_grid.publish(coarse_msg)
+        
+        # Publish fine occupancy grid
+        fine_msg = OccupancyGrid()
+        fine_msg.header = header
+        fine_msg.grid_rows = self.fine_rows
+        fine_msg.grid_cols = self.fine_cols
+        fine_msg.data = fine_grid.flatten().tolist()
+        fine_msg.grid_type = "fine"
+        self.pub_fine_grid.publish(fine_msg)
+        
+        # Publish images
+        try:
+            self.pub_raw_image.publish(self.bridge.cv2_to_imgmsg(raw_frame, "bgr8"))
+            self.pub_debug_image.publish(self.bridge.cv2_to_imgmsg(debug_frame, "bgr8"))
+            self.pub_binary_image.publish(self.bridge.cv2_to_imgmsg(binary_frame, "mono8"))
+        except CvBridgeError as e:
+            self.get_logger().error(f"CV Bridge error: {e}")
+    
+    def print_console_output(self, robot_data, coarse_grid, fine_grid):
+        """Print detection info to console"""
+        if not self.console_output:
+            return
+        
+        current_time = time.time()
+        if current_time - self.last_console_print < (1.0 / self.console_rate):
+            return
+        
+        self.last_console_print = current_time
+        
+        print("\n" + "="*60)
+        print(f"Frame {self.frame_count} | Total Microbots: {len(robot_data)}")
+        print("="*60)
+        
+        print(f"\nCoarse Grid ({self.coarse_rows}x{self.coarse_cols}):")
+        for row in range(self.coarse_rows):
+            row_str = " | ".join([f"{coarse_grid[row, col]:2d}" for col in range(self.coarse_cols)])
+            print(f"  {row_str}")
+        
+        print(f"\nFine Grid ({self.fine_rows}x{self.fine_cols}):")
+        for row in range(self.fine_rows):
+            row_str = " ".join([f"{fine_grid[row, col]:2d}" for col in range(self.fine_cols)])
+            print(f"  {row_str}")
+        
+        if len(robot_data) > 0:
+            print("\nDetected Microbots:")
+            for i, robot in enumerate(robot_data[:10]):
+                print(f"  ID {robot['id']}: pos=({robot['x']:.1f}, {robot['y']:.1f}), "
+                      f"coarse=({robot['coarse_row']},{robot['coarse_col']}), "
+                      f"fine=({robot['fine_row']},{robot['fine_col']})")
+            if len(robot_data) > 10:
+                print(f"  ... and {len(robot_data) - 10} more")
+    
+    def timer_callback(self):
+        """Main processing loop called by ROS2 timer"""
+        if self.cap is None or not self.cap.isOpened():
+            return
+        
+        # Read frame
+        ret, frame = self.cap.read()
+        
+        if not ret:
+            self.get_logger().warn("Failed to grab frame from camera")
+            return
+        
+        # Apply ROI if specified
+        frame = self.apply_roi(frame)
+        raw_frame = frame.copy()
+        
+        # Frame skipping
+        if self.skip_frames > 0:
+            self.skip_counter += 1
+            if self.skip_counter <= self.skip_frames:
+                return
+            self.skip_counter = 0
+        
+        self.frame_count += 1
+        
+        # Process frame
+        binary, gray = self.preprocess_frame(frame)
+        robot_data, contours = self.detect_microbots(binary)
+        robot_data = self.assign_robot_ids(robot_data)
+        coarse_grid, fine_grid = self.create_occupancy_grids(robot_data, frame.shape)
+        
+        # Create visualization
+        debug_frame = self.draw_visualization(frame, robot_data, contours, 
+                                             coarse_grid, fine_grid)
+        
+        # Publish all data
+        self.publish_data(robot_data, coarse_grid, fine_grid, 
+                        debug_frame, binary, raw_frame)
+        
+        # Console output
+        self.print_console_output(robot_data, coarse_grid, fine_grid)
+        
+        # Show OpenCV windows if enabled
+        if self.show_opencv_windows:
+            cv2.imshow('Microbot Detection - Debug View', debug_frame)
+            cv2.imshow('Binary Image', binary)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                self.get_logger().info("Quit key pressed")
+                rclpy.shutdown()
+            elif key == ord('+'):
+                self.binary_threshold = min(255, self.binary_threshold + 5)
+                self.get_logger().info(f"Threshold increased to {self.binary_threshold}")
+            elif key == ord('-'):
+                self.binary_threshold = max(0, self.binary_threshold - 5)
+                self.get_logger().info(f"Threshold decreased to {self.binary_threshold}")
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        self.get_logger().info("Cleaning up...")
+        if self.cap is not None:
+            self.cap.release()
+        cv2.destroyAllWindows()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    
+    try:
+        node = MicrobotDetectorNode()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if 'node' in locals():
+            node.cleanup()
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

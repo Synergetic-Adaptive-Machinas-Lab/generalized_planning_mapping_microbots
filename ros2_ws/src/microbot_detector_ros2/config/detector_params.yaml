@@ -1,0 +1,76 @@
+# Microbot Detector ROS2 Configuration File
+
+microbot_detector:
+  ros__parameters:
+    # Camera Settings
+    camera:
+      index: 4                    # USB camera index (usually 0, 1, 2, etc.)
+      frame_width: 640            # Camera frame width in pixels
+      frame_height: 480           # Camera frame height in pixels
+      fps: 30                     # Frames per second (if supported by camera)
+      
+      # Region of Interest (ROI) - Set to crop the camera view
+      # Set all to -1 to use full frame
+      roi_x: -1                   # X offset for ROI (pixels from left)
+      roi_y: -1                   # Y offset for ROI (pixels from top)
+      roi_width: -1               # Width of ROI (-1 for full width)
+      roi_height: -1              # Height of ROI (-1 for full height)
+
+    # Detection Parameters
+    detection:
+      binary_threshold: 60       # Threshold for black/white conversion (0-255)
+      min_contour_area: 5         # Minimum area in pixels to consider as robot
+      max_contour_area: 5000      # Maximum area in pixels to consider as robot
+      gaussian_blur_kernel: 5     # Kernel size for Gaussian blur (odd number)
+      
+      # Morphological operations to clean up detection
+      use_morphology: true        # Apply morphological operations
+      morph_kernel_size: 3        # Kernel size for morphology
+      morph_iterations: 1         # Number of iterations
+
+    # Grid Configuration
+    grid:
+      coarse_rows: 3              # Number of rows in coarse grid
+      coarse_cols: 3              # Number of columns in coarse grid
+      fine_rows: 9                # Number of rows in fine grid (more precise)
+      fine_cols: 9                # Number of columns in fine grid
+
+    # ROS Topics
+    topics:
+      robot_count: "/microbot/count"              # Int32 - total number of robots
+      robot_positions: "/microbot/positions"      # MicrobotArray - all robot positions
+      coarse_grid: "/microbot/occupancy/coarse"   # OccupancyGrid - coarse grid
+      fine_grid: "/microbot/occupancy/fine"       # OccupancyGrid - fine grid
+      debug_image: "/microbot/debug/image"        # Image - annotated frame
+      binary_image: "/microbot/debug/binary"      # Image - binary thresholded image
+      raw_image: "/microbot/camera/raw"           # Image - raw camera feed
+
+    # Visualization Settings
+    visualization:
+      show_opencv_windows: true   # Show OpenCV windows (for debugging)
+      draw_grid_lines: true       # Draw grid lines on debug image
+      draw_contours: true         # Draw contours around detected robots
+      draw_centroids: true        # Draw centroid markers
+      draw_ids: true              # Draw robot IDs
+      draw_occupancy_text: true   # Draw occupancy counts in grid cells
+      
+      # Colors (BGR format)
+      grid_color: [0, 255, 0]     # Green
+      contour_color: [0, 0, 255]  # Red
+      centroid_color: [255, 0, 0] # Blue
+      id_text_color: [255, 255, 0] # Cyan
+
+    # Tracking Settings
+    tracking:
+      enable_tracking: true       # Enable simple tracking with IDs
+      max_distance: 50            # Maximum distance (pixels) to associate with previous position
+      
+    # Performance Settings
+    performance:
+      publish_rate: 30            # Maximum publishing rate (Hz)
+      skip_frames: 0              # Skip N frames between processing (0 = process all)
+      
+    # Logging
+    logging:
+      console_output: true        # Print detection info to console
+      console_rate: 1.0           # How often to print to console (Hz)

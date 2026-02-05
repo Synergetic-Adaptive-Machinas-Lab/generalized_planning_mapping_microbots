@@ -1,0 +1,360 @@
+# Complete ROS2 Installation Guide
+
+## Download and Extract
+
+You have downloaded the ROS2 package. Extract it:
+
+```bash
+# For .tar.gz file:
+tar -xzf microbot_detector_ros2.tar.gz
+
+# For .zip file:
+unzip microbot_detector_ros2.zip
+```
+
+## Step-by-Step Installation
+
+### 1. Set Up ROS2 Workspace
+
+Since you're in your current directory, let's create the workspace there:
+
+```bash
+# Create workspace in your current directory
+cd ~/Documents/object_tracking/generalized_planning_mapping_microbots
+mkdir -p ros2_ws/src
+
+# Copy the package
+cp -r microbot_detector_ros2 ros2_ws/src/
+
+# Navigate to workspace
+cd ros2_ws
+```
+
+### 2. Install Dependencies
+
+```bash
+# Install ROS2 dependencies
+sudo apt update
+sudo apt install -y \
+    ros-${ROS_DISTRO}-cv-bridge \
+    ros-${ROS_DISTRO}-image-tools \
+    ros-${ROS_DISTRO}-rqt-image-view \
+    python3-opencv \
+    python3-numpy \
+    python3-scipy
+
+# If you're not sure of your ROS_DISTRO, check with:
+echo $ROS_DISTRO
+# Should show: humble, iron, or jazzy
+
+# If not set, source ROS2 first:
+source /opt/ros/humble/setup.bash  # or iron/jazzy
+```
+
+### 3. Build the Package
+
+```bash
+# From the workspace root (ros2_ws)
+cd ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws
+
+# Build with colcon
+colcon build --packages-select microbot_detector_ros2
+
+# This will create build/, install/, and log/ directories
+```
+
+### 4. Source the Workspace
+
+```bash
+# Source the workspace
+source install/setup.bash
+
+# Verify package is found
+ros2 pkg list | grep microbot
+# Should show: microbot_detector_ros2
+```
+
+### 5. Add to .bashrc (Optional but Recommended)
+
+```bash
+# Add to your .bashrc so it's always sourced
+echo "source ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws/install/setup.bash" >> ~/.bashrc
+```
+
+## Quick Test
+
+### Test 1: Check Package
+```bash
+ros2 pkg list | grep microbot
+# Should output: microbot_detector_ros2
+
+ros2 pkg prefix microbot_detector_ros2
+# Should show the install path
+```
+
+### Test 2: Check Messages
+```bash
+ros2 interface show microbot_detector_ros2/msg/MicrobotPosition
+# Should show the message definition
+```
+
+### Test 3: Launch (Dry Run)
+```bash
+ros2 launch microbot_detector_ros2 microbot_detector.launch.py
+# Will try to start - press Ctrl+C after you see it attempting to open camera
+```
+
+## Camera Setup
+
+### Find Your Camera
+```bash
+ls -l /dev/video*
+# Note which device is your camera (e.g., video0, video4)
+```
+
+### Test Camera Access
+```bash
+# Quick test
+python3 -c "import cv2; cap = cv2.VideoCapture(0); print('OK' if cap.isOpened() else 'FAIL'); cap.release()"
+```
+
+### Fix Permissions (if needed)
+```bash
+sudo usermod -a -G video $USER
+# Then logout and login
+```
+
+## Calibration
+
+```bash
+cd ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws/src/microbot_detector_ros2/microbot_detector_ros2
+
+# Run calibration (replace 0 with your camera index)
+python3 camera_calibration.py 0
+
+# Adjust settings with keyboard:
+# + / - : adjust threshold
+# a / A : adjust min area
+# z / Z : adjust max area
+# s     : save settings
+# q     : quit
+```
+
+This creates `calibrated_params.yaml` in the current directory.
+
+## Running the Detector
+
+### Terminal 1: Launch the Detector
+
+```bash
+# Source workspace
+source ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws/install/setup.bash
+
+# Launch with default config
+ros2 launch microbot_detector_ros2 microbot_detector.launch.py
+
+# OR with calibrated config
+cd ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws/src/microbot_detector_ros2/microbot_detector_ros2
+ros2 launch microbot_detector_ros2 microbot_detector.launch.py \
+    config_file:=$(pwd)/calibrated_params.yaml
+```
+
+### Terminal 2: View Topics
+
+```bash
+# List all topics
+ros2 topic list
+
+# View robot count
+ros2 topic echo /microbot/count
+
+# View positions
+ros2 topic echo /microbot/positions
+
+# View coarse grid
+ros2 topic echo /microbot/occupancy/coarse
+```
+
+### Terminal 3: View Images
+
+```bash
+# View debug image
+ros2 run rqt_image_view rqt_image_view /microbot/debug/image
+
+# OR use image view
+ros2 run image_tools showimage --ros-args -r image:=/microbot/debug/image
+```
+
+## Common Issues
+
+### Issue 1: "Package not found"
+
+**Problem:**
+```
+Package 'microbot_detector_ros2' not found
+```
+
+**Solution:**
+```bash
+# Make sure you sourced the workspace
+source ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws/install/setup.bash
+
+# Rebuild if needed
+cd ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws
+colcon build --packages-select microbot_detector_ros2
+```
+
+### Issue 2: "Camera not found"
+
+**Problem:**
+```
+ERROR: Failed to open camera at index 0
+```
+
+**Solution:**
+```bash
+# Find your camera
+ls -l /dev/video*
+
+# Edit config file
+cd ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws/src/microbot_detector_ros2
+nano config/detector_params.yaml
+# Change camera.index to correct value
+
+# Rebuild
+cd ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws
+colcon build --packages-select microbot_detector_ros2
+```
+
+### Issue 3: "Build failed"
+
+**Problem:**
+```
+CMake Error or compilation errors
+```
+
+**Solution:**
+```bash
+# Clean and rebuild
+cd ~/Documents/object_tracking/generalized_planning_mapping_microbots/ros2_ws
+rm -rf build/ install/ log/
+colcon build --packages-select microbot_detector_ros2
+
+# Check dependencies
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+### Issue 4: "No robots detected"
+
+**Solution:**
+1. Run calibration tool
+2. Check lighting - need good contrast
+3. Ensure white background
+4. Adjust threshold in config file
+
+## File Structure
+
+```
+ros2_ws/
+├── build/                      # Build artifacts
+├── install/                    # Installed files
+├── log/                        # Build logs
+└── src/
+    └── microbot_detector_ros2/
+        ├── CMakeLists.txt      # Build configuration
+        ├── package.xml         # Package metadata
+        ├── setup.py            # Python setup
+        ├── README.md           # Full documentation
+        ├── QUICKSTART.md       # Quick start guide
+        ├── config/
+        │   └── detector_params.yaml  # Configuration
+        ├── launch/
+        │   └── microbot_detector.launch.py  # Launch file
+        ├── msg/
+        │   ├── MicrobotPosition.msg
+        │   ├── MicrobotArray.msg
+        │   └── OccupancyGrid.msg
+        ├── resource/
+        │   └── microbot_detector_ros2  # Resource marker
+        └── microbot_detector_ros2/
+            ├── __init__.py
+            ├── microbot_detector_node.py  # Main node
+            └── camera_calibration.py      # Calibration tool
+```
+
+## Useful ROS2 Commands
+
+```bash
+# List all nodes
+ros2 node list
+
+# Get node info
+ros2 node info /microbot_detector
+
+# List topics
+ros2 topic list
+
+# View topic data
+ros2 topic echo /microbot/count
+
+# Check topic frequency
+ros2 topic hz /microbot/count
+
+# Check topic bandwidth
+ros2 topic bw /microbot/debug/image
+
+# List parameters
+ros2 param list /microbot_detector
+
+# Get parameter value
+ros2 param get /microbot_detector camera.index
+
+# Set parameter (runtime)
+ros2 param set /microbot_detector detection.binary_threshold 160
+
+# Record data
+ros2 bag record -a
+ros2 bag record /microbot/count /microbot/positions
+
+# Play recorded data
+ros2 bag play <bag_file>
+```
+
+## Next Steps
+
+1. ✅ Extract package
+2. ✅ Build with colcon
+3. ✅ Run calibration
+4. ✅ Launch detector
+5. View topics
+6. Record data
+7. Develop your own nodes
+8. Integrate with your control system
+
+## Get Help
+
+- Read README.md in the package
+- Check QUICKSTART.md for quick reference
+- View ROS2 docs: docs.ros.org
+- Check node logs: `ros2 node info /microbot_detector`
+- Check parameter help: `ros2 param describe /microbot_detector <param_name>`
+
+## Summary Commands
+
+```bash
+# One-time setup
+cd ~/Documents/object_tracking/generalized_planning_mapping_microbots
+mkdir -p ros2_ws/src
+cp -r microbot_detector_ros2 ros2_ws/src/
+cd ros2_ws
+colcon build --packages-select microbot_detector_ros2
+source install/setup.bash
+
+# Run detector
+ros2 launch microbot_detector_ros2 microbot_detector.launch.py
+
+# View in another terminal
+ros2 topic echo /microbot/count
+```
+
+Good luck with your microbot detection! 🤖
